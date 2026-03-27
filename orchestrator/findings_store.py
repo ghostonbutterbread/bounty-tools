@@ -174,3 +174,83 @@ def format_finding_for_intigriti(finding: dict) -> str:
         f"- Status: {finding['status']}",
     ]
     return "\n".join(lines)
+
+
+# ── Professional Report Generator ──────────────────────────────────────────────
+
+def generate_professional_report(
+    finding: dict,
+    output_path: str | Path,
+) -> Path:
+    """Generate a professional markdown report from a finding dict.
+
+    Args:
+        finding: A finding dict with keys:
+            - title: Report title
+            - vuln_type: e.g. "information-disclosure", "auth-bypass"
+            - target: Target asset or domain
+            - severity: Low / Medium / High / Critical
+            - summary: 1-2 sentence executive summary
+            - impact: Impact description
+            - technical_details: (optional) technical explanation
+            - steps: (optional) list of repro steps
+            - request_response: (optional) raw request/response block
+            - remediation: (optional) fix guidance
+            - references: (optional) list of reference URLs
+            - cve: (optional) CVE ID
+            - reporter: (optional) your name/handle
+        output_path: Where to write the .md file
+
+    Returns:
+        Path to the written report
+    """
+    try:
+        from report_generator.report_generator import Finding, ReportWriter
+    except ImportError:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "report_generator",
+            Path(__file__).parent.parent / "report_generator" / "report_generator.py",
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        Finding = mod.Finding
+        ReportWriter = mod.ReportWriter
+
+    f = Finding(
+        title=finding.get("title", "Unnamed Finding"),
+        vuln_type=finding.get("vuln_type", "unknown"),
+        target=finding.get("target", "unknown"),
+        severity=finding.get("severity", "Medium"),
+        summary=finding.get("summary", finding.get("description", "No summary provided.")),
+        impact=finding.get("impact", "Impact not specified."),
+        technical_details=finding.get("technical_details", ""),
+        steps=finding.get("steps", []),
+        request_response=finding.get("request_response", ""),
+        remediation=finding.get("remediation", ""),
+        references=finding.get("references", []),
+        cve=finding.get("cve", ""),
+        reporter=finding.get("reporter", ""),
+        extra_rows=finding.get("extra_rows", {}),
+        off_flow_diagram=finding.get("off_flow_diagram", ""),
+    )
+
+    output_path = Path(output_path)
+    writer = ReportWriter(f)
+    writer.write(output_path)
+    return output_path
+
+
+def finding_to_report(finding: dict, program: str, vuln_type: str) -> Path:
+    """Convenience: generate a report from a finding dict.
+
+    Writes to: ~/Shared/bounty_recon/{program}/ghost/reports/{vuln_type}_{target}.md
+    """
+    target = finding.get("target", "unknown").replace("/", "_")
+    program_dir = Path.home() / "Shared" / "bounty_recon" / program / "ghost" / "reports"
+    program_dir.mkdir(parents=True, exist_ok=True)
+
+    filename = f"{vuln_type}_{target}_{datetime.now().strftime('%Y%m%d')}.md"
+    output_path = program_dir / filename
+
+    return generate_professional_report(finding, output_path)
