@@ -1,0 +1,29 @@
+{
+  "dorks": [
+    "\"api_key\" \"github\"",
+    "\"aws_access_key_id\"",
+    "\"aws_secret_access_key\"",
+    "\"xoxb-\"",
+    "\"xoxp-\"",
+    "\"ghp_\"",
+    "\"github_pat_\"",
+    "\"private_key\" \"BEGIN RSA PRIVATE KEY\"",
+    "\"BEGIN OPENSSH PRIVATE KEY\"",
+    "\"-----BEGIN PRIVATE KEY-----\"",
+    "\"password=\"",
+    "\"passwd=\"",
+    "\"DATABASE_URL=\"",
+    "\"MONGO_URI=\"",
+    "\"JWT_SECRET=\"",
+    "\"SECRET_KEY=\"",
+    "\"ACCESS_TOKEN=\"",
+    "\"NPM_TOKEN=\"",
+    "\"HEROKU_API_KEY\"",
+    "\"SLACK_WEBHOOK_URL\"",
+    "\"Authorization: Bearer\"",
+    "\".env\" \"DB_PASSWORD\"",
+    "\"id_rsa\"",
+    "\"client_secret\"",
+    "\"token=\" \"oauth\""
+  ]
+}

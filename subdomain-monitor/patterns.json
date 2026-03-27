@@ -1,0 +1,82 @@
+{
+  "services": [
+    {
+      "name": "GitHub Pages",
+      "cname_suffixes": ["github.io"],
+      "http_body_regex": [
+        "There isn't a GitHub Pages site here",
+        "404\\\\s*\\\\|\\\\s*Not Found"
+      ],
+      "http_header_regex": ["server:\\\\s*github\\\\.com"],
+      "references": [
+        "https://docs.github.com/en/pages",
+        "https://github.com/EdOverflow/can-i-take-over-xyz"
+      ]
+    },
+    {
+      "name": "Heroku",
+      "cname_suffixes": ["herokudns.com", "herokuapp.com"],
+      "http_body_regex": [
+        "No such app",
+        "heroku\\\\s*\\\\|\\\\s*No such app"
+      ],
+      "http_header_regex": ["via:\\\\s*1\\\\.1\\\\s*vegur"],
+      "references": [
+        "https://devcenter.heroku.com/",
+        "https://github.com/EdOverflow/can-i-take-over-xyz"
+      ]
+    },
+    {
+      "name": "AWS S3",
+      "cname_suffixes": ["s3.amazonaws.com", "s3-website", "amazonaws.com"],
+      "http_body_regex": [
+        "NoSuchBucket",
+        "The specified bucket does not exist"
+      ],
+      "http_header_regex": ["x-amz-request-id", "server:\\\\s*amazon"],
+      "references": [
+        "https://docs.aws.amazon.com/AmazonS3/latest/userguide/WebsiteEndpoints.html",
+        "https://github.com/EdOverflow/can-i-take-over-xyz"
+      ]
+    },
+    {
+      "name": "Azure",
+      "cname_suffixes": ["azurewebsites.net", "cloudapp.net", "trafficmanager.net"],
+      "http_body_regex": [
+        "404 Web Site not found",
+        "The resource you are looking for has been removed"
+      ],
+      "http_header_regex": ["x-ms-request-id", "server:\\\\s*microsoft"],
+      "references": [
+        "https://learn.microsoft.com/azure",
+        "https://github.com/EdOverflow/can-i-take-over-xyz"
+      ]
+    },
+    {
+      "name": "Fastly",
+      "cname_suffixes": ["fastly.net", "fastlylb.net"],
+      "http_body_regex": [
+        "Fastly error: unknown domain",
+        "unknown domain:\\\\s*.*fastly"
+      ],
+      "http_header_regex": ["x-served-by:\\\\s*cache-"],
+      "references": [
+        "https://www.fastly.com/documentation/",
+        "https://github.com/EdOverflow/can-i-take-over-xyz"
+      ]
+    },
+    {
+      "name": "Shopify",
+      "cname_suffixes": ["myshopify.com"],
+      "http_body_regex": [
+        "Sorry, this shop is currently unavailable",
+        "Only one step left"
+      ],
+      "http_header_regex": ["x-sorting-hat-podid", "server:\\\\s*cloudflare"],
+      "references": [
+        "https://help.shopify.com/",
+        "https://github.com/EdOverflow/can-i-take-over-xyz"
+      ]
+    }
+  ]
+}

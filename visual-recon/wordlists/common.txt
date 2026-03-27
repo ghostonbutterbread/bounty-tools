@@ -1,0 +1,19 @@
+# Common directories/files for quick recon
+admin
+login
+dashboard
+api
+robots.txt
+sitemap.xml
+uploads
+assets
+backup
+config
+.git
+.env
+server-status
+dev
+staging
+portal
+wp-admin
+wp-login.php
