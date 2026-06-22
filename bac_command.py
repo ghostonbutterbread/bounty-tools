@@ -32,11 +32,15 @@ import json
 import re
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).parent))
 from bac_checks import BACChecks, Severity, BACFinding
+from recon_storage import atomic_write_text, recon_bucket, safe_slug
 
-BASE_DIR = Path.home() / "Shared" / "bounty_recon"
+BOUNTY_CORE_PATH = Path.home() / "projects" / "bounty-core"
+DEFAULT_CORE_FAMILY = "web_bounty"
+DEFAULT_CORE_LANE = "web"
 
 
 def get_priority_filter(focus: str) -> str | None:
@@ -181,75 +185,190 @@ def validate_target(target: str) -> tuple[bool, str]:
     return True, ""
 
 
-def sanitize_program(program: str) -> Path:
-    """Return safe output directory."""
-    safe = re.sub(r"[^a-zA-Z0-9_\-]", "", program or "ghost") or "ghost"
-    base = BASE_DIR / safe / "ghost" / "bac"
+def _sanitize_core_program(program: str, default: str = "ghost") -> str:
+    """Normalize bounty-core program/target identity strings."""
+    safe_program = re.sub(r"[^a-z0-9_\-]+", "-", (program or default).lower()).strip("-")
+    return safe_program or default
+
+
+def _infer_core_program(target: str) -> str:
+    """Infer a bounty-core program/target identity from the target hostname."""
+    parsed = urlparse(target)
+    host = (parsed.hostname or parsed.netloc or "").lower().strip()
+    if host.startswith("www."):
+        host = host[4:]
+    return _sanitize_core_program(host)
+
+
+def _load_bounty_core():
+    """Import bounty-core, falling back to ~/projects/bounty-core for dev installs."""
     try:
-        resolved = base.resolve()
-        resolved.relative_to(BASE_DIR.resolve())
-        return base
-    except ValueError:
-        return BASE_DIR / "ghost" / "bac"
+        from bounty_core import add_finding
+        return add_finding, None
+    except Exception as first_error:
+        if BOUNTY_CORE_PATH.exists():
+            sys.path.insert(0, str(BOUNTY_CORE_PATH))
+            try:
+                from bounty_core import add_finding
+                return add_finding, None
+            except Exception as second_error:
+                return None, second_error
+        return None, first_error
+
+
+def _finding_to_core_payload(finding: BACFinding, *, program: str, family: str,
+                             lane: str, focus: str, target: str) -> dict:
+    """Convert one BAC checklist item into bounty-core's normalized finding shape."""
+    vuln_type = "auth" if finding.category == "auth_bypass" else "bac"
+    parsed = urlparse(finding.endpoint)
+    asset = (f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+             if parsed.scheme and parsed.netloc else finding.endpoint)
+    tags = ["bac", finding.category, focus]
+    if vuln_type == "auth":
+        tags.append("auth")
+
+    return {
+        "program": program,
+        "family": family,
+        "lane": lane,
+        "type": vuln_type,
+        "status": "raw",
+        "severity": finding.severity.value.upper(),
+        "title": f"BAC checklist: {finding.test_name}",
+        "asset": asset,
+        "url": finding.endpoint,
+        "endpoint": finding.endpoint,
+        "method": finding.method,
+        "parameter": re.sub(r"[^a-z0-9_\-]+", "-", finding.test_name.lower()).strip("-"),
+        "target": target,
+        "category": finding.category,
+        "focus": focus,
+        "summary": finding.description,
+        "expected": finding.expected,
+        "poc": finding.poc,
+        "references": finding.references,
+        "evidence": [
+            f"method={finding.method}",
+            f"endpoint={finding.endpoint}",
+            f"expected={finding.expected}",
+        ],
+        "tags": tags,
+        "source_tool": "bac_command.py",
+        "source_repo": "bounty-tools",
+        "agent": "bounty-tools.bac",
+    }
+
+
+def write_core_findings(program: str, family: str, lane: str, focus: str,
+                        target: str, test_matrix: list[BACFinding]) -> dict:
+    """Write BAC checklist candidates to bounty-core ledger/report/indexes."""
+    add_finding, error = _load_bounty_core()
+    if add_finding is None:
+        return {"ok": False, "error": f"bounty-core unavailable: {error}", "written": 0, "new": 0}
+
+    written = 0
+    new = 0
+    last_layout = None
+    errors = []
+    for finding in test_matrix:
+        payload = _finding_to_core_payload(
+            finding,
+            program=program,
+            family=family,
+            lane=lane,
+            focus=focus,
+            target=target,
+        )
+        try:
+            result = add_finding(payload, program=program, family=family, lane=lane)
+            written += 1
+            if result.get("is_new"):
+                new += 1
+            last_layout = result.get("layout") or last_layout
+        except Exception as exc:
+            errors.append(str(exc))
+
+    return {"ok": not errors, "written": written, "new": new, "layout": last_layout, "errors": errors}
 
 
 def save_output(program: str, focus: str, target: str,
                 test_matrix: list[BACFinding],
+                *,
+                family: str = DEFAULT_CORE_FAMILY,
+                lane: str = DEFAULT_CORE_LANE,
                 detailed: bool = False) -> tuple[Path, Path]:
-    """Save test matrix and findings report."""
+    """Save BAC checklist artifacts under the canonical recon bucket."""
     date_str = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    base = sanitize_program(program)
-    base.mkdir(parents=True, exist_ok=True)
+    parsed = urlparse(target)
+    host = parsed.hostname or parsed.netloc or target
+    bucket = recon_bucket(
+        program,
+        family=family,
+        lane=lane,
+        parts=("bac", safe_slug(host.lower(), default="target"), safe_slug(focus, default="all")),
+    )
+    base = bucket.bucket
 
     # Matrix file
     matrix_file = base / f"matrix_{focus}_{date_str}.md"
-    with open(matrix_file, "w") as f:
-        f.write(f"# BAC Test Matrix — {datetime.now().strftime('%Y-%m-%d %H:%M')}\n")
-        f.write(f"**Target:** `{target}`\n")
-        f.write(f"**Focus:** {focus}\n")
-        f.write(f"**Tests:** {len(test_matrix)}\n\n")
-        f.write("| Priority | Category | Method | Test | Endpoint | Status |\n")
-        f.write("|----------|----------|--------|------|---------|--------|\n")
-        for t in test_matrix:
-            prio = "P0" if t.severity == Severity.CRITICAL else \
-                   "P1" if t.severity == Severity.HIGH else "P2"
-            f.write(f"| {prio} | {t.category} | {t.method} | "
-                    f"{t.test_name} | `{t.endpoint}` | ❌ Pending |\n")
+    matrix_lines = [
+        f"# BAC Test Matrix — {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        f"**Target:** `{target}`",
+        f"**Focus:** {focus}",
+        f"**Program:** {bucket.program}",
+        f"**Family/Lane:** {bucket.family}/{bucket.lane}",
+        f"**Tests:** {len(test_matrix)}",
+        "",
+        "| Priority | Category | Method | Test | Endpoint | Status |",
+        "|----------|----------|--------|------|---------|--------|",
+    ]
+    for t in test_matrix:
+        prio = "P0" if t.severity == Severity.CRITICAL else \
+               "P1" if t.severity == Severity.HIGH else "P2"
+        matrix_lines.append(
+            f"| {prio} | {t.category} | {t.method} | "
+            f"{t.test_name} | `{t.endpoint}` | Pending |"
+        )
+    atomic_write_text(matrix_file, "\n".join(matrix_lines) + "\n")
 
     # Findings report
     findings_file = base / f"findings_{focus}_{date_str}.md"
-    with open(findings_file, "w") as f:
-        f.write(f"# BAC Findings — {datetime.now().strftime('%Y-%m-%d %H:%M')}\n")
-        f.write(f"**Target:** `{target}`\n")
-        f.write(f"**Focus:** {focus}\n\n")
+    findings_lines = [
+        f"# BAC Findings — {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        f"**Target:** `{target}`",
+        f"**Focus:** {focus}",
+        f"**Program:** {bucket.program}",
+        f"**Family/Lane:** {bucket.family}/{bucket.lane}",
+        "",
+    ]
+    for severity_level, prio_label in [
+        (Severity.CRITICAL, "P0"),
+        (Severity.HIGH, "P1"),
+        (Severity.MEDIUM, "P2"),
+    ]:
+        relevant = [x for x in test_matrix if x.severity == severity_level]
+        if not relevant:
+            continue
+        findings_lines.extend(["", f"## {prio_label} — {severity_level.value.upper()} ({len(relevant)} tests)", ""])
+        for t in relevant:
+            status = "Resolved" if t.resolved else "OPEN"
+            findings_lines.append(f"### {t.test_name} — {status}")
+            findings_lines.append(f"**Endpoint:** {t.method} `{t.endpoint}`")
+            findings_lines.append(f"**Category:** {t.category}")
+            findings_lines.append(f"**Expected:** {t.expected}")
+            if t.actual:
+                findings_lines.append(f"**Actual:** {t.actual}")
+            if t.notes:
+                findings_lines.append(f"**Notes:** {t.notes}")
+            if detailed and t.poc:
+                findings_lines.append(f"**PoC:**\n```\n{t.poc}\n```")
+            findings_lines.append(f"**References:** {', '.join(t.references)}")
+            findings_lines.append("")
 
-        for severity_level, prio_label in [
-            (Severity.CRITICAL, "P0"),
-            (Severity.HIGH, "P1"),
-            (Severity.MEDIUM, "P2"),
-        ]:
-            relevant = [x for x in test_matrix if x.severity == severity_level]
-            if not relevant:
-                continue
-            f.write(f"\n## {prio_label} — {severity_level.value.upper()} ({len(relevant)} tests)\n\n")
-            for t in relevant:
-                status = "✅ Resolved" if t.resolved else "❌ OPEN"
-                f.write(f"### {t.test_name} — {status}\n")
-                f.write(f"**Endpoint:** {t.method} `{t.endpoint}`\n")
-                f.write(f"**Category:** {t.category}\n")
-                f.write(f"**Expected:** {t.expected}\n")
-                if t.actual:
-                    f.write(f"**Actual:** {t.actual}\n")
-                if t.notes:
-                    f.write(f"**Notes:** {t.notes}\n")
-                if detailed and t.poc:
-                    f.write(f"**PoC:**\n```\n{t.poc}\n```\n")
-                f.write(f"**References:** {', '.join(t.references)}\n\n")
-
-        open_c = sum(1 for x in test_matrix if not x.resolved)
-        res_c = sum(1 for x in test_matrix if x.resolved)
-        f.write(f"\n---\n**Total:** {len(test_matrix)} | "
-                f"✅ Resolved: {res_c} | ❌ Open: {open_c}\n")
+    open_c = sum(1 for x in test_matrix if not x.resolved)
+    res_c = sum(1 for x in test_matrix if x.resolved)
+    findings_lines.extend(["", "---", f"**Total:** {len(test_matrix)} | Resolved: {res_c} | Open: {open_c}"])
+    atomic_write_text(findings_file, "\n".join(findings_lines) + "\n")
 
     return matrix_file, findings_file
 
@@ -266,13 +385,23 @@ def main():
                                  "auth_bypass", "idor", "p0", "p1", "p2"],
                         help="Test focus (default: all)")
     parser.add_argument("--program", "-p", default=None,
-                        help="Bug bounty program name (output directory)")
+                        help="Deprecated compatibility program name; used as canonical identity only when --core-program/--name is omitted")
     parser.add_argument("--output", "-o", choices=["summary", "detailed"],
                         default="summary", help="Output detail level")
     parser.add_argument("--dry-run", action="store_true",
                         help="Show test matrix without saving")
     parser.add_argument("--json", action="store_true",
                         help="Output test matrix as JSON")
+    parser.add_argument("--core-program", "--name", dest="core_program", default=None,
+                        help="bounty-core program/target identity/name (default: --program when set, otherwise infer from target hostname)")
+    parser.add_argument("--family", default=DEFAULT_CORE_FAMILY,
+                        help=f"bounty-core storage family for ledger writes (default: {DEFAULT_CORE_FAMILY})")
+    parser.add_argument("--lane", default=DEFAULT_CORE_LANE,
+                        help=f"bounty-core storage lane for ledger writes (default: {DEFAULT_CORE_LANE})")
+    parser.add_argument("--write-core", action="store_true",
+                        help="Opt in to bounty-core writes for manually validated BAC findings/checklist items")
+    parser.add_argument("--no-core", action="store_true",
+                        help="Deprecated alias for the default behavior: do not write BAC checklist items to bounty-core")
 
     args = parser.parse_args()
 
@@ -310,10 +439,26 @@ def main():
         print(f"\n{len(test_matrix)} tests total")
         sys.exit(0)
 
+    core_program = _sanitize_core_program(args.core_program or args.program) if (args.core_program or args.program) else _infer_core_program(args.target)
+
     matrix_file, findings_file = save_output(
-        args.program or "ghost", args.focus, args.target,
-        test_matrix, detailed=(args.output == "detailed")
+        core_program, args.focus, args.target,
+        test_matrix,
+        family=args.family,
+        lane=args.lane,
+        detailed=(args.output == "detailed"),
     )
+
+    core_result = None
+    if args.write_core and not args.no_core:
+        core_result = write_core_findings(
+            core_program,
+            args.family,
+            args.lane,
+            args.focus,
+            args.target,
+            test_matrix,
+        )
 
     p0 = sum(1 for t in test_matrix if t.severity == Severity.CRITICAL)
     p1 = sum(1 for t in test_matrix if t.severity == Severity.HIGH)
@@ -321,8 +466,21 @@ def main():
 
     print(f"🎯 BAC Test Matrix — {args.target}")
     print(f"   Focus: {args.focus} — {len(test_matrix)} tests ({p0}P0, {p1}P1, {p2}P2)")
+    print(f"   Recon bucket: {matrix_file.parent}")
+    if args.write_core and not args.no_core:
+        print(f"   bounty-core identity: program={core_program} family={args.family} lane={args.lane}")
+    else:
+        print("   bounty-core: checklist promotion disabled by default (use --write-core only after validation)")
     print(f"   📋 Matrix:  {matrix_file}")
     print(f"   📝 Findings: {findings_file}")
+    if core_result:
+        if core_result.get("ok"):
+            layout = core_result.get("layout") or {}
+            print(f"   bounty-core: wrote {core_result.get('written', 0)} findings ({core_result.get('new', 0)} new)")
+            if layout.get("canonical_root"):
+                print(f"   bounty-core root: {layout['canonical_root']}")
+        else:
+            print(f"   bounty-core: skipped/partial — {core_result.get('error') or core_result.get('errors')}")
     print()
     print("Run tests manually and update findings, or integrate into orchestrator.")
 

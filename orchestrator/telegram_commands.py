@@ -610,7 +610,8 @@ print(f"Results: {{results_file}}")
     except Exception as e:
         return f"❌ Failed to start dork process: {e}"
 
-    results_dir = os.path.expanduser(f"/home/ryushe/Shared/bounty_recon/{program}/ghost/dorks")
+    from recon_storage import recon_bucket
+    results_dir = recon_bucket(program, parts=("dorks",), create=False).bucket
 
     lines = [
         f"🔍 *Google Dorking Started*",
@@ -646,7 +647,7 @@ def cmd_secrets(args: list) -> str:
             "Usage: /secrets <program> [--source js_dir|urls_file|wayback]\n\n"
             "Scan JS files, URL lists, or Wayback for secrets.\n\n"
             "Sources:\n"
-            "  js_dir    - Scan downloaded JS files in ghost/js_analysis/raw_js/\n"
+            "  js_dir    - Scan downloaded JS files in recon/js/raw/\n"
             "  urls_file - Scan params.txt for secrets in URLs\n"
             "  wayback  - Query Wayback Machine for JS files\n\n"
             "Example:\n"
@@ -664,15 +665,16 @@ def cmd_secrets(args: list) -> str:
         else:
             return f"Unknown argument: {args[1]}\nUse --source js_dir|urls_file|wayback"
 
-    from pathlib import Path
-    program_dir = Path.home() / "Shared" / "bounty_recon" / program
+    from recon_storage import resolve_recon_root
+    recon_root, layout = resolve_recon_root(program, create=False)
+    program_dir = recon_root
     if not program_dir.exists():
-        return f"Program directory not found: {program_dir}"
+        return f"Program recon directory not found: {program_dir}"
 
     # Determine source paths
-    js_dir = program_dir / "ghost" / "js_analysis" / "raw_js"
-    urls_file = program_dir / "params.txt"
-    output_dir = program_dir / "ghost" / "secrets_scan"
+    js_dir = program_dir / "js" / "raw"
+    urls_file = program_dir / "params" / "params.txt"
+    output_dir = program_dir / "secrets_scan"
 
     finder = SecretsFinder(program=program)
 
@@ -1114,10 +1116,10 @@ def cmd_threat_map(args: list) -> str:
     program = args[0]
 
     # Quick validation
-    from pathlib import Path
-    program_dir = Path.home() / "Shared" / "bounty_recon" / program
-    if not program_dir.exists():
-        return f"Program directory not found: {program_dir}\n\nUse a program that exists in ~/Shared/bounty_recon/"
+    from recon_storage import resolve_recon_root
+    recon_root, _ = resolve_recon_root(program, create=False)
+    if not recon_root.exists():
+        return f"Program recon directory not found: {recon_root}"
 
     # Run threat map
     try:

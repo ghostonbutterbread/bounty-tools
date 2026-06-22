@@ -16,11 +16,43 @@ import os
 import re
 import json
 import stat
+import sys
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from typing import Optional
 
-BASE_DIR = Path.home() / "Shared" / "bounty_recon"
+DEFAULT_CORE_FAMILY = "web_bounty"
+DEFAULT_CORE_LANE = "web"
+BOUNTY_CORE_PATH = Path(os.environ.get("BOUNTY_CORE_PATH", str(Path.home() / "projects" / "bounty-core")))
+
+
+def _load_resolve_storage():
+    try:
+        from bounty_core import resolve_storage
+        return resolve_storage
+    except Exception:
+        if BOUNTY_CORE_PATH.exists() and str(BOUNTY_CORE_PATH) not in sys.path:
+            sys.path.insert(0, str(BOUNTY_CORE_PATH))
+        try:
+            from bounty_core import resolve_storage
+            return resolve_storage
+        except Exception:
+            return None
+
+
+def _safe_program(program: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9._-]+", "_", str(program or "").lower().replace(" ", "_")).strip("._-") or "unknown"
+
+
+def _credential_dir(program: str, *, family: str, lane: str, base_dir: Optional[Path] = None) -> Path:
+    safe = _safe_program(program)
+    if base_dir is not None:
+        return Path(base_dir) / safe / "credentials"
+    resolve_storage = _load_resolve_storage()
+    if resolve_storage is not None:
+        layout = resolve_storage(safe, family=family, lane=lane, create=False)
+        return layout.context_root / "credentials"
+    return Path.home() / "Shared" / family / safe / lane / "context" / "credentials"
 
 
 @dataclass
@@ -48,18 +80,24 @@ class CredentialStore:
     Manages per-program credentials with secure file permissions.
     
     Directory structure:
-        ~/Shared/bounty_recon/{program}/
-        ├── credentials/
-        │   ├── credentials.env    # chmod 600
-        │   └── account.json      # chmod 600
+        ~/Shared/{family}/{program}/{lane}/context/credentials/
+        ├── credentials.env    # chmod 600
+        └── account.json       # chmod 600
     """
     
-    def __init__(self, program: str, base_dir: Path = BASE_DIR):
-        # Sanitize program name — prevent path traversal
-        safe = re.sub(r"[^a-zA-Z0-9_\-]", "", program.lower().replace(" ", "_")) or "unknown"
-        self.program = safe
-        self.base_dir = Path(base_dir)
-        self.cred_dir = self.base_dir / self.program / "credentials"
+    def __init__(
+        self,
+        program: str,
+        base_dir: Optional[Path] = None,
+        *,
+        family: str = DEFAULT_CORE_FAMILY,
+        lane: str = DEFAULT_CORE_LANE,
+    ):
+        self.program = _safe_program(program)
+        self.family = family
+        self.lane = lane
+        self.base_dir = Path(base_dir) if base_dir is not None else None
+        self.cred_dir = _credential_dir(self.program, family=family, lane=lane, base_dir=self.base_dir)
         self.cred_file = self.cred_dir / "credentials.env"
         self.account_file = self.cred_dir / "account.json"
     
@@ -210,14 +248,13 @@ class CredentialStore:
             os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)  # 0o600
 
 
-def list_programs() -> list[str]:
+def list_programs(*, family: str = DEFAULT_CORE_FAMILY, lane: str | None = None) -> list[str]:
     """List all programs that have credential stores."""
-    if not BASE_DIR.exists():
+    base = Path.home() / "Shared" / family
+    if not base.exists():
         return []
-    return [
-        d.name for d in BASE_DIR.iterdir()
-        if d.is_dir() and (d / "credentials" / "credentials.env").exists()
-    ]
+    pattern = f"*/{lane or '*'}/context/credentials/credentials.env"
+    return sorted({path.parents[3].name for path in base.glob(pattern)})
 
 
 if __name__ == "__main__":
@@ -229,6 +266,9 @@ if __name__ == "__main__":
     # init
     p_init = sub.add_parser("init", help="Initialize credential store for a program")
     p_init.add_argument("program", help="Program name")
+    p_init.add_argument("--core-program", "--name", dest="core_program", default=None, help="bounty-core program/target identity/name")
+    p_init.add_argument("--family", default=DEFAULT_CORE_FAMILY, help=f"bounty-core storage family (default: {DEFAULT_CORE_FAMILY})")
+    p_init.add_argument("--lane", default=DEFAULT_CORE_LANE, help=f"bounty-core storage lane (default: {DEFAULT_CORE_LANE})")
     
     # store
     p_store = sub.add_parser("store", help="Store credentials")
@@ -237,32 +277,40 @@ if __name__ == "__main__":
     p_store.add_argument("--session", help="Session token")
     p_store.add_argument("--email", help="Account email")
     p_store.add_argument("--platform", help="Platform (hackerone, bugcrowd, etc.)")
+    p_store.add_argument("--core-program", "--name", dest="core_program", default=None, help="bounty-core program/target identity/name")
+    p_store.add_argument("--family", default=DEFAULT_CORE_FAMILY, help=f"bounty-core storage family (default: {DEFAULT_CORE_FAMILY})")
+    p_store.add_argument("--lane", default=DEFAULT_CORE_LANE, help=f"bounty-core storage lane (default: {DEFAULT_CORE_LANE})")
     
     # list
-    sub.add_parser("list", help="List programs with credentials")
+    p_list = sub.add_parser("list", help="List programs with credentials")
+    p_list.add_argument("--family", default=DEFAULT_CORE_FAMILY, help=f"bounty-core storage family (default: {DEFAULT_CORE_FAMILY})")
+    p_list.add_argument("--lane", default=None, help="Optional bounty-core lane filter")
     
     # validate
     p_validate = sub.add_parser("validate", help="Validate credentials for a program")
     p_validate.add_argument("program", help="Program name")
+    p_validate.add_argument("--core-program", "--name", dest="core_program", default=None, help="bounty-core program/target identity/name")
+    p_validate.add_argument("--family", default=DEFAULT_CORE_FAMILY, help=f"bounty-core storage family (default: {DEFAULT_CORE_FAMILY})")
+    p_validate.add_argument("--lane", default=DEFAULT_CORE_LANE, help=f"bounty-core storage lane (default: {DEFAULT_CORE_LANE})")
     
     args = parser.parse_args()
     
     if args.cmd == "init":
-        store = CredentialStore(args.program)
+        store = CredentialStore(args.core_program or args.program, family=args.family, lane=args.lane)
         if store.init():
             print(f"✅ Created credential store for '{store.program}'")
         else:
             print(f"ℹ️  Credential store for '{store.program}' already exists")
     
     elif args.cmd == "store":
-        store = CredentialStore(args.program)
+        store = CredentialStore(args.core_program or args.program, family=args.family, lane=args.lane)
         creds = Credentials(api_token=args.token, session_token=args.session)
         account = Account(email=args.email or "", platform=args.platform) if args.email else None
         store.store(creds, account)
         print(f"✅ Stored credentials for '{store.program}'")
     
     elif args.cmd == "list":
-        programs = list_programs()
+        programs = list_programs(family=args.family, lane=args.lane)
         if programs:
             print("Programs with credentials:")
             for p in programs:
@@ -271,7 +319,7 @@ if __name__ == "__main__":
             print("No credential stores found.")
     
     elif args.cmd == "validate":
-        store = CredentialStore(args.program)
+        store = CredentialStore(args.core_program or args.program, family=args.family, lane=args.lane)
         creds = store.get()
         valid = store.validate(creds)
         account = store.get_account()

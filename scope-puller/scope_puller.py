@@ -25,15 +25,44 @@ from urllib.parse import urlparse
 
 import requests
 
+TOOLS_ROOT = Path(__file__).resolve().parents[1]
+if str(TOOLS_ROOT) not in sys.path:
+    sys.path.insert(0, str(TOOLS_ROOT))
+from recon_storage import atomic_write_json, atomic_write_text, recon_bucket, safe_slug
+
 
 USER_AGENT = "scope-puller/1.0"
 DEFAULT_TIMEOUT = 20
 DEFAULT_RETRIES = 5
 DEFAULT_BACKOFF = 1.5
+BOUNTY_CORE_PATH = Path.home() / "projects" / "bounty-core"
+DEFAULT_CORE_FAMILY = "web_bounty"
+DEFAULT_CORE_LANE = "web"
 
 
 class ScopePullerError(Exception):
     pass
+
+
+
+def _sanitize_core_program(program: str, default: str = "scope-puller") -> str:
+    safe_program = re.sub(r"[^a-z0-9_\-]+", "-", (program or default).lower()).strip("-")
+    return safe_program or default
+
+
+def _load_bounty_core():
+    try:
+        from bounty_core import add_finding
+        return add_finding, None
+    except Exception as first_error:
+        if BOUNTY_CORE_PATH.exists():
+            sys.path.insert(0, str(BOUNTY_CORE_PATH))
+            try:
+                from bounty_core import add_finding
+                return add_finding, None
+            except Exception as second_error:
+                return None, second_error
+        return None, first_error
 
 
 @dataclass
@@ -332,6 +361,192 @@ def render_markdown(programs: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _target_asset(target: Dict[str, Any]) -> str:
+    return str(target.get("asset") or "").strip()
+
+
+def _asset_domain(asset: str) -> Optional[str]:
+    asset = asset.strip()
+    if not asset:
+        return None
+    parsed = urlparse(asset if "://" in asset else f"//{asset}")
+    host = parsed.hostname
+    if host:
+        return host.lower().lstrip("*.").rstrip(".")
+    candidate = asset.lstrip("*.").rstrip(".")
+    if re.fullmatch(r"[A-Za-z0-9.-]+\.[A-Za-z]{2,}", candidate):
+        return candidate.lower()
+    return None
+
+
+def _scope_text_artifacts(program_data: Dict[str, Any]) -> Dict[str, str]:
+    targets = program_data.get("scope_targets") or []
+    assets = sorted({asset for target in targets for asset in [_target_asset(target)] if asset})
+    eligible_assets = sorted({
+        asset
+        for target in targets
+        for asset in [_target_asset(target)]
+        if asset and target.get("eligible_for_bounty", False)
+    })
+    domains = sorted({domain for asset in assets for domain in [_asset_domain(asset)] if domain})
+    return {
+        "in-scope.txt": "\n".join(eligible_assets or assets) + ("\n" if assets or eligible_assets else ""),
+        "domains.txt": "\n".join(domains) + ("\n" if domains else ""),
+    }
+
+
+def _combined_scope_text_artifacts(programs: List[Dict[str, Any]]) -> Dict[str, str]:
+    targets = [target for program in programs for target in (program.get("scope_targets") or [])]
+    return _scope_text_artifacts({"scope_targets": targets})
+
+
+def save_scope_recon_outputs(
+    programs: List[Dict[str, Any]],
+    failures: List[Dict[str, str]],
+    *,
+    output_dir: Optional[str],
+    json_out: Optional[str],
+    md_out: Optional[str],
+    core_program: Optional[str],
+    family: str,
+    lane: str,
+    filters: Dict[str, Any],
+) -> List[Dict[str, str]]:
+    """Persist full scope inventory under canonical recon storage unless paths are explicit."""
+    written: List[Dict[str, str]] = []
+
+    if output_dir or json_out or md_out:
+        base = Path(output_dir) if output_dir else Path(".")
+        json_path = Path(json_out) if json_out else base / "scope_results.json"
+        md_path = Path(md_out) if md_out else base / "scope_results.md"
+        payload = {
+            "generated_at_epoch": int(time.time()),
+            "programs": programs,
+            "failures": failures,
+            "filters": filters,
+        }
+        atomic_write_json(json_path, payload)
+        atomic_write_text(md_path, render_markdown(programs))
+        files = {"json": str(json_path), "markdown": str(md_path)}
+        text_base = Path(output_dir) if output_dir else json_path.parent
+        for name, content in _combined_scope_text_artifacts(programs).items():
+            path = text_base / name
+            atomic_write_text(path, content)
+            files[name] = str(path)
+        written.append(files)
+        return written
+
+    for program_data in programs:
+        program = _sanitize_core_program(core_program) if core_program else _infer_core_program(program_data)
+        scope_part = safe_slug(str(program_data.get("program_handle") or program_data.get("platform") or program), default="scope")
+        bucket = recon_bucket(program, family=family, lane=lane, parts=("scope", scope_part))
+        payload = {
+            "generated_at_epoch": int(time.time()),
+            "programs": [program_data],
+            "failures": [f for f in failures if f.get("url") in {program_data.get("input_url"), program_data.get("source_url")}],
+            "filters": filters,
+        }
+        json_path = bucket.bucket / "scope_results.json"
+        md_path = bucket.bucket / "scope_results.md"
+        atomic_write_json(json_path, payload)
+        atomic_write_text(md_path, render_markdown([program_data]))
+        files = {"json": str(json_path), "markdown": str(md_path)}
+        for name, content in _scope_text_artifacts(program_data).items():
+            path = bucket.bucket / name
+            atomic_write_text(path, content)
+            files[name] = str(path)
+        written.append(files)
+
+    if failures and not programs:
+        bucket = recon_bucket(core_program or "scope-puller", family=family, lane=lane, parts=("scope", "failures"))
+        json_path = bucket.bucket / "scope_results.json"
+        payload = {
+            "generated_at_epoch": int(time.time()),
+            "programs": [],
+            "failures": failures,
+            "filters": filters,
+        }
+        atomic_write_json(json_path, payload)
+        atomic_write_text(bucket.bucket / "scope_results.md", render_markdown([]))
+        written.append({"json": str(json_path), "markdown": str(bucket.bucket / "scope_results.md")})
+
+    return written
+
+
+def _infer_core_program(program: Dict[str, Any]) -> str:
+    return _sanitize_core_program(
+        str(program.get("program_handle") or program.get("program_name") or program.get("platform") or "scope-puller")
+    )
+
+
+def _program_summary_to_core_payload(program_data: Dict[str, Any], *, program: str, family: str, lane: str) -> Dict[str, Any]:
+    platform = program_data.get("platform") or "unknown"
+    handle = program_data.get("program_handle") or "unknown"
+    targets = program_data.get("scope_targets") or []
+    return {
+        "program": program,
+        "family": family,
+        "lane": lane,
+        "type": "scope",
+        "status": "raw",
+        "severity": "INFO",
+        "title": f"Scope pull: {program_data.get('program_name') or handle}",
+        "asset": str(program_data.get("input_url") or program_data.get("source_url") or handle),
+        "url": str(program_data.get("input_url") or program_data.get("source_url") or ""),
+        "platform": platform,
+        "program_handle": handle,
+        "program_name": program_data.get("program_name"),
+        "bounty_eligible": bool(program_data.get("bounty_eligible")),
+        "scope_target_count": len(targets),
+        "recent_report_stats": program_data.get("recent_report_stats") or {},
+        "summary": "Scope puller fetched public program metadata and scope targets.",
+        "evidence": [
+            f"platform={platform}",
+            f"program={handle}",
+            f"scope_targets={len(targets)}",
+            f"bounty_eligible={bool(program_data.get('bounty_eligible'))}",
+        ],
+        "tags": ["scope", platform, "program-summary"],
+        "source_tool": "scope_puller.py",
+        "source_repo": "bounty-tools",
+        "agent": "bounty-tools.scope-puller",
+    }
+
+
+def write_core_findings(core_program: Optional[str], family: str, lane: str, programs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    add_finding, error = _load_bounty_core()
+    if add_finding is None:
+        return {"ok": False, "error": f"bounty-core unavailable: {error}", "written": 0, "new": 0}
+
+    written = 0
+    new = 0
+    last_layout = None
+    errors: List[str] = []
+    program_names: List[str] = []
+    for program_data in programs:
+        program = _sanitize_core_program(core_program) if core_program else _infer_core_program(program_data)
+        program_names.append(program)
+        payloads = [_program_summary_to_core_payload(program_data, program=program, family=family, lane=lane)]
+        for payload in payloads:
+            try:
+                result = add_finding(payload, program=program, family=family, lane=lane)
+                written += 1
+                if result.get("is_new"):
+                    new += 1
+                last_layout = result.get("layout") or last_layout
+            except Exception as exc:
+                errors.append(str(exc))
+
+    return {
+        "ok": not errors,
+        "written": written,
+        "new": new,
+        "layout": last_layout,
+        "errors": errors,
+        "programs": sorted(set(program_names)),
+    }
+
+
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Pull program scope from HackerOne and Bugcrowd.")
     parser.add_argument(
@@ -339,12 +554,18 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         nargs="+",
         help="Program URLs (hackerone.com/programs/* or bugcrowd.com/*/program)",
     )
-    parser.add_argument("--json-out", default="scope_results.json", help="JSON output path")
-    parser.add_argument("--md-out", default="scope_results.md", help="Markdown output path")
+    parser.add_argument("--output", default=None, help="Output directory (default: canonical recon/scope/<program-or-platform>/)")
+    parser.add_argument("--json-out", default=None, help="Explicit JSON output path (overrides canonical default)")
+    parser.add_argument("--md-out", default=None, help="Explicit Markdown output path (overrides canonical default)")
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="HTTP timeout seconds")
     parser.add_argument("--max-retries", type=int, default=DEFAULT_RETRIES, help="Max retries")
     parser.add_argument("--backoff", type=float, default=DEFAULT_BACKOFF, help="Initial backoff seconds")
     parser.add_argument("--bounty-only", action="store_true", help="Only include targets eligible for bounty")
+    parser.add_argument("--core-program", "--name", dest="core_program", default=None, help="bounty-core program/target identity/name (default: infer per pulled program handle)")
+    parser.add_argument("--family", default=DEFAULT_CORE_FAMILY, help=f"bounty-core storage family (default: {DEFAULT_CORE_FAMILY})")
+    parser.add_argument("--lane", default=DEFAULT_CORE_LANE, help=f"bounty-core storage lane (default: {DEFAULT_CORE_LANE})")
+    parser.add_argument("--write-core", action="store_true", help="Opt in to bounty-core summary ledger/report/index writes")
+    parser.add_argument("--no-core", action="store_true", help="Disable bounty-core ledger/report/index writes; recon artifacts are still written")
     return parser.parse_args(argv)
 
 
@@ -385,18 +606,34 @@ def main(argv: Optional[List[str]] = None) -> int:
             filtered_count = len(p["scope_targets"])
             print(f"Filtered {p.get('program_name', 'Unknown')}: {original_count} -> {filtered_count} bounty targets")
 
-    payload = {
-        "generated_at_epoch": int(time.time()),
-        "programs": programs,
-        "failures": failures,
-        "filters": {"bounty_only": args.bounty_only},
-    }
+    output_files = save_scope_recon_outputs(
+        programs,
+        failures,
+        output_dir=args.output,
+        json_out=args.json_out,
+        md_out=args.md_out,
+        core_program=args.core_program,
+        family=args.family,
+        lane=args.lane,
+        filters={"bounty_only": args.bounty_only},
+    )
 
-    Path(args.json_out).write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-    Path(args.md_out).write_text(render_markdown(programs), encoding="utf-8")
+    if args.write_core and not args.no_core and programs:
+        core_result = write_core_findings(args.core_program, args.family, args.lane, programs)
+        if core_result.get("ok"):
+            programs_label = ",".join(core_result.get("programs") or [])
+            print(f"bounty-core: wrote={core_result['written']} new={core_result['new']} program={programs_label} family={args.family} lane={args.lane}")
+        else:
+            print(f"bounty-core: skipped/failed: {core_result.get('error') or core_result.get('errors')}", file=sys.stderr)
 
-    print(f"Wrote JSON: {args.json_out}")
-    print(f"Wrote Markdown: {args.md_out}")
+    if not args.write_core:
+        print("bounty-core: summary promotion disabled by default (use --write-core to opt in)")
+
+    for files in output_files:
+        if "json" in files:
+            print(f"Wrote JSON: {files['json']}")
+        if "markdown" in files:
+            print(f"Wrote Markdown: {files['markdown']}")
 
     if failures:
         print(f"Completed with {len(failures)} failure(s).", file=sys.stderr)

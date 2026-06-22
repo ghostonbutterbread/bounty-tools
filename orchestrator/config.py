@@ -3,8 +3,29 @@
 
 import os
 import json
+import sys
+from pathlib import Path
 
-ORCHESTRATOR_DIR = os.path.expanduser("~/Shared/bounty_recon/orchestrator")
+DEFAULT_CORE_FAMILY = "web_bounty"
+DEFAULT_CORE_LANE = "web"
+BOUNTY_CORE_PATH = Path(os.environ.get("BOUNTY_CORE_PATH", str(Path.home() / "projects" / "bounty-core")))
+
+
+def _orchestrator_dir() -> str:
+    try:
+        from bounty_core import resolve_storage
+    except Exception:
+        if BOUNTY_CORE_PATH.exists() and str(BOUNTY_CORE_PATH) not in sys.path:
+            sys.path.insert(0, str(BOUNTY_CORE_PATH))
+        try:
+            from bounty_core import resolve_storage
+        except Exception:
+            return str(Path.home() / "Shared" / DEFAULT_CORE_FAMILY / "orchestrator" / DEFAULT_CORE_LANE / "working" / "orchestrator")
+    layout = resolve_storage("orchestrator", family=DEFAULT_CORE_FAMILY, lane=DEFAULT_CORE_LANE, create=False)
+    return str(layout.working_root / "orchestrator")
+
+
+ORCHESTRATOR_DIR = _orchestrator_dir()
 STATE_FILE = os.path.join(ORCHESTRATOR_DIR, "state.json")
 FINDINGS_DIR = os.path.join(ORCHESTRATOR_DIR, "findings")
 

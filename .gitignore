@@ -9,3 +9,4 @@ credentials/
 secrets/
 .DS_Store
 .vscode/
+/dashboard/

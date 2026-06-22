@@ -17,11 +17,20 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
+TOOLS_ROOT = Path(__file__).resolve().parents[1]
+if str(TOOLS_ROOT) not in sys.path:
+    sys.path.insert(0, str(TOOLS_ROOT))
+from recon_storage import atomic_write_json, atomic_write_text, recon_bucket, safe_slug
+
 
 GITHUB_API_BASE = "https://api.github.com"
 DEFAULT_DORKS_FILE = "dorks.json"
 DEFAULT_OUTPUT_JSON = "results.json"
 DEFAULT_OUTPUT_MD = "results.md"
+BOUNTY_CORE_PATH = Path.home() / "projects" / "bounty-core"
+DEFAULT_CORE_FAMILY = "web_bounty"
+DEFAULT_CORE_LANE = "web"
+
 
 
 def load_dorks(path: str) -> List[str]:
@@ -233,8 +242,7 @@ def normalize_item(item: Dict[str, Any], dork: str) -> Dict[str, Any]:
 
 
 def write_json(path: str, payload: Dict[str, Any]) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, ensure_ascii=False)
+    atomic_write_json(Path(path), payload)
 
 
 def write_markdown(path: str, payload: Dict[str, Any]) -> None:
@@ -271,8 +279,7 @@ def write_markdown(path: str, payload: Dict[str, Any]) -> None:
             )
             lines.append("")
 
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines).rstrip() + "\n")
+    atomic_write_text(Path(path), "\n".join(lines).rstrip() + "\n")
 
 
 def dedupe_results(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -293,6 +300,177 @@ def parse_csv_arg(value: Optional[str]) -> Optional[List[str]]:
     entries = [x.strip() for x in value.split(",")]
     entries = [x for x in entries if x]
     return entries or None
+
+
+def _sanitize_core_program(program: str, default: str = "github-dorks") -> str:
+    safe_program = re.sub(r"[^a-z0-9_\-]+", "-", (program or default).lower()).strip("-")
+    return safe_program or default
+
+
+def _infer_core_program(allowed_orgs: Optional[List[str]], results: List[Dict[str, Any]]) -> str:
+    if allowed_orgs:
+        return _sanitize_core_program(allowed_orgs[0])
+    owners = [((r.get("repository") or {}).get("owner") or "").strip() for r in results]
+    owners = [o for o in owners if o]
+    if owners:
+        return _sanitize_core_program(owners[0])
+    return "github-dorks"
+
+
+def _load_bounty_core():
+    try:
+        from bounty_core import add_finding
+        return add_finding, None
+    except Exception as first_error:
+        if BOUNTY_CORE_PATH.exists():
+            sys.path.insert(0, str(BOUNTY_CORE_PATH))
+            try:
+                from bounty_core import add_finding
+                return add_finding, None
+            except Exception as second_error:
+                return None, second_error
+        return None, first_error
+
+
+def _github_dork_type(row: Dict[str, Any]) -> str:
+    haystack = " ".join(str(row.get(k) or "") for k in ("dork", "name", "path", "html_url")).lower()
+    disclosure_markers = (
+        "secret", "token", "apikey", "api_key", "api-key", "api key", "password", "passwd",
+        "credential", "credentials", "private_key", "private key", "client_secret", "access_key",
+        "aws_secret", "aws_secret_access_key", "authorization", "bearer", ".env", "oauth", "webhook",
+    )
+    return "info-disclosure" if any(marker in haystack for marker in disclosure_markers) else "recon"
+
+
+def _has_likely_secret_marker(row: Dict[str, Any]) -> bool:
+    haystack = " ".join(str(row.get(k) or "") for k in ("dork", "name", "path", "html_url")).lower()
+    conservative_markers = (
+        "api_key", "apikey", "api-key", "api key",
+        "access_key", "aws_access_key_id", "aws_secret_access_key", "aws_secret",
+        "client_secret", "private_key", "private key", "id_rsa",
+        "secret", "token", "bearer", "oauth", "authorization",
+        "password", "passwd", "credential", "credentials",
+        ".env", "slack_webhook", "webhook",
+    )
+    sensitive_paths = (
+        ".env", "credentials", "secrets", "id_rsa", "private-key", "private_key",
+        "settings.py", "application.yml", "application.yaml", "config.json",
+    )
+    return any(marker in haystack for marker in conservative_markers) or any(path in haystack for path in sensitive_paths)
+
+
+def _eligible_where_known(row: Dict[str, Any]) -> bool:
+    eligibility = row.get("bounty_eligibility") or {}
+    if eligibility.get("eligible") is False:
+        return False
+    return True
+
+
+def should_promote_result(row: Dict[str, Any]) -> bool:
+    """Only promote likely secret/leak candidates, respecting eligibility filters when present."""
+    return _has_likely_secret_marker(row) and _eligible_where_known(row)
+
+
+def _result_to_core_payload(row: Dict[str, Any], *, program: str, family: str, lane: str) -> Dict[str, Any]:
+    repo = row.get("repository") or {}
+    finding_type = _github_dork_type(row)
+    severity = "LOW" if finding_type == "info-disclosure" else "INFO"
+    repo_name = repo.get("full_name") or "unknown-repo"
+    path = row.get("path") or row.get("name") or "unknown-path"
+    eligible = (row.get("bounty_eligibility") or {}).get("eligible")
+    return {
+        "program": program,
+        "family": family,
+        "lane": lane,
+        "type": finding_type,
+        "status": "raw",
+        "severity": severity,
+        "title": f"GitHub dork result: {repo_name} / {path}",
+        "asset": repo.get("html_url") or row.get("html_url") or repo_name,
+        "url": row.get("html_url"),
+        "repository": repo_name,
+        "repository_url": repo.get("html_url"),
+        "file_path": row.get("path"),
+        "file_name": row.get("name"),
+        "sha": row.get("sha"),
+        "score": row.get("score"),
+        "dork": row.get("dork"),
+        "bounty_eligible": eligible,
+        "eligibility_reasons": (row.get("bounty_eligibility") or {}).get("reasons", []),
+        "summary": "GitHub code search returned a public repository match. Review manually before treating as an exposed secret.",
+        "evidence": [
+            f"dork={row.get('dork')}",
+            f"file={row.get('html_url')}",
+            f"repository={repo.get('html_url')}",
+        ],
+        "tags": ["github-dorks", finding_type, "eligible" if eligible else "candidate"],
+        "source_tool": "github_dorks.py",
+        "source_repo": "bounty-tools",
+        "agent": "bounty-tools.github-dorks",
+    }
+
+
+def write_core_findings(program: str, family: str, lane: str, results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    add_finding, error = _load_bounty_core()
+    if add_finding is None:
+        return {"ok": False, "error": f"bounty-core unavailable: {error}", "written": 0, "new": 0}
+
+    written = 0
+    new = 0
+    last_layout = None
+    errors: List[str] = []
+    promoted_results = [row for row in results if should_promote_result(row)]
+    for row in promoted_results:
+        payload = _result_to_core_payload(row, program=program, family=family, lane=lane)
+        try:
+            result = add_finding(payload, program=program, family=family, lane=lane)
+            written += 1
+            if result.get("is_new"):
+                new += 1
+            last_layout = result.get("layout") or last_layout
+        except Exception as exc:
+            errors.append(str(exc))
+
+    return {
+        "ok": not errors,
+        "written": written,
+        "new": new,
+        "promoted": len(promoted_results),
+        "layout": last_layout,
+        "errors": errors,
+    }
+
+
+def save_github_dork_recon_output(
+    payload: Dict[str, Any],
+    *,
+    output_dir: Optional[str],
+    out_json: Optional[str],
+    out_md: Optional[str],
+    program: str,
+    owner: str,
+    family: str,
+    lane: str,
+) -> Dict[str, str]:
+    """Persist full GitHub dork inventory under canonical recon storage unless paths are explicit."""
+    if output_dir or out_json or out_md:
+        base = Path(output_dir) if output_dir else Path(".")
+        json_path = Path(out_json) if out_json else base / DEFAULT_OUTPUT_JSON
+        md_path = Path(out_md) if out_md else base / DEFAULT_OUTPUT_MD
+    else:
+        run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        bucket = recon_bucket(
+            program,
+            family=family,
+            lane=lane,
+            parts=("github-dorks", safe_slug(owner, default=program), run_id),
+        )
+        json_path = bucket.bucket / DEFAULT_OUTPUT_JSON
+        md_path = bucket.bucket / DEFAULT_OUTPUT_MD
+
+    write_json(str(json_path), payload)
+    write_markdown(str(md_path), payload)
+    return {"json": str(json_path), "markdown": str(md_path)}
 
 
 def main() -> int:
@@ -319,9 +497,14 @@ def main() -> int:
     )
     parser.add_argument("--per-page", type=int, default=50, help="GitHub search per_page (max 100)")
     parser.add_argument("--max-pages", type=int, default=2, help="Max pages per dork")
-    parser.add_argument("--out-json", default=DEFAULT_OUTPUT_JSON, help="JSON output path")
-    parser.add_argument("--out-md", default=DEFAULT_OUTPUT_MD, help="Markdown output path")
+    parser.add_argument("--output", default=None, help="Output directory (default: canonical recon/github-dorks/<program-or-owner>/<run>/)")
+    parser.add_argument("--out-json", default=None, help="Explicit JSON output path (overrides canonical default)")
+    parser.add_argument("--out-md", default=None, help="Explicit Markdown output path (overrides canonical default)")
     parser.add_argument("--verbose", action="store_true", help="Verbose logging")
+    parser.add_argument("--core-program", "--name", dest="core_program", default=None, help="bounty-core program/target identity/name (default: infer from --allowed-orgs or first repo owner)")
+    parser.add_argument("--family", default=DEFAULT_CORE_FAMILY, help=f"bounty-core storage family (default: {DEFAULT_CORE_FAMILY})")
+    parser.add_argument("--lane", default=DEFAULT_CORE_LANE, help=f"bounty-core storage lane (default: {DEFAULT_CORE_LANE})")
+    parser.add_argument("--no-core", action="store_true", help="Disable bounty-core ledger/report/index writes; recon artifacts are still written")
     args = parser.parse_args()
 
     if not args.token:
@@ -393,11 +576,33 @@ def main() -> int:
         "results": all_results,
     }
 
-    write_json(args.out_json, payload)
-    write_markdown(args.out_md, payload)
+    core_program = _sanitize_core_program(args.core_program) if args.core_program else _infer_core_program(allowed_orgs, all_results)
+    owner = core_program
+    if allowed_orgs:
+        owner = allowed_orgs[0]
+    elif all_results:
+        owner = ((all_results[0].get("repository") or {}).get("owner") or core_program)
 
-    print(f"Wrote JSON: {args.out_json}")
-    print(f"Wrote Markdown: {args.out_md}")
+    output_files = save_github_dork_recon_output(
+        payload,
+        output_dir=args.output,
+        out_json=args.out_json,
+        out_md=args.out_md,
+        program=core_program,
+        owner=owner,
+        family=args.family,
+        lane=args.lane,
+    )
+
+    if not args.no_core and all_results:
+        core_result = write_core_findings(core_program, args.family, args.lane, all_results)
+        if core_result.get("ok"):
+            print(f"bounty-core: promoted={core_result['promoted']} wrote={core_result['written']} new={core_result['new']} program={core_program} family={args.family} lane={args.lane}")
+        else:
+            print(f"bounty-core: skipped/failed: {core_result.get('error') or core_result.get('errors')}", file=sys.stderr)
+
+    print(f"Wrote JSON: {output_files['json']}")
+    print(f"Wrote Markdown: {output_files['markdown']}")
     print(
         f"Results: total={payload['summary']['total_results']} eligible={payload['summary']['eligible_results']}"
     )

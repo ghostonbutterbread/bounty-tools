@@ -13,7 +13,7 @@ try:
     from .config import STATE_FILE, ensure_dirs
 except ImportError:
     # Fallback if config not yet loaded
-    _ORCHESTRATOR_DIR = os.path.expanduser("~/Shared/bounty_recon/orchestrator")
+    _ORCHESTRATOR_DIR = os.path.expanduser("~/Shared/web_bounty/orchestrator/web/working/orchestrator")
     STATE_FILE = os.path.join(_ORCHESTRATOR_DIR, "state.json")
     def ensure_dirs():
         os.makedirs(_ORCHESTRATOR_DIR, exist_ok=True)

@@ -20,29 +20,35 @@ sys.path.insert(0, "/home/ryushe/projects/bounty-tools")
 from orchestrator.spawn import AgentRuntime, run_agent, spawn_agent
 from orchestrator.context_prep import prep_recon_context
 from orchestrator.state_manager import state_mgr
-from orchestrator.findings_store import save_finding, create_finding
+from orchestrator.findings_store import (
+    DEFAULT_CORE_FAMILY,
+    DEFAULT_CORE_LANE,
+    infer_core_program,
+    save_finding,
+    create_finding,
+)
 
 
 # ─── Logging Setup ────────────────────────────────────────────────────────────
 
-def get_logger(program: str, tool: str = "hunt"):
+def get_logger(program: str, tool: str = "hunt", *, family: str = DEFAULT_CORE_FAMILY, lane: str = DEFAULT_CORE_LANE):
     """Get a SubagentLogger instance if available."""
     try:
         from subagent_logger import SubagentLogger
         import uuid
         agent_id = f"{tool}_{datetime.now().strftime('%H%M%S')}"
-        return SubagentLogger(tool, program, agent_id)
+        return SubagentLogger(tool, program, agent_id, family=family, lane=lane)
     except ImportError:
         return None
 
 
 # ─── Credential Loading ───────────────────────────────────────────────────────
 
-def load_credentials(program: str):
+def load_credentials(program: str, *, family: str = DEFAULT_CORE_FAMILY, lane: str = DEFAULT_CORE_LANE):
     """Load credentials for a program."""
     try:
         from credential_store import CredentialStore
-        store = CredentialStore(program)
+        store = CredentialStore(program, family=family, lane=lane)
         creds = store.get()
         account = store.get_account()
         return creds, account
@@ -79,7 +85,17 @@ def format_bac_tests_for_agent(bac_tests: list) -> str:
 
 # ─── Fuzz Integration ────────────────────────────────────────────────────────
 
-def run_fuzz(target: str, mode: str, wordlist: str = "auto", program: str = None):
+def run_fuzz(
+    target: str,
+    mode: str,
+    wordlist: str = "auto",
+    program: str = None,
+    *,
+    core_program: str = None,
+    family: str = DEFAULT_CORE_FAMILY,
+    lane: str = DEFAULT_CORE_LANE,
+    no_core: bool = False,
+):
     """Run fuzz_command.py and return results.
 
     Note: This spawns ffuf directly rather than using an agent.
@@ -96,17 +112,24 @@ def run_fuzz(target: str, mode: str, wordlist: str = "auto", program: str = None
     wordlist_path = wordlist_map.get(mode, wordlist_map["dir"])
     wordlist_path = os.path.expanduser(wordlist_path)
 
-    output_file = os.path.expanduser(
-        f"~/Shared/bounty_recon/{program}/ghost/fuzz/raw_{mode}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-    ) if program else None
-
     cmd = [
         "python3",
         "/home/ryushe/projects/bounty-tools/fuzz_command.py",
         target,
         mode,
-        "--output", output_file or "/dev/null"
     ]
+    if program:
+        cmd.extend(["--program", program])
+    if core_program:
+        cmd.extend(["--core-program", core_program])
+    if family:
+        cmd.extend(["--family", family])
+    if lane:
+        cmd.extend(["--lane", lane])
+    if no_core:
+        cmd.append("--no-core")
+    if wordlist and wordlist != "auto":
+        cmd.extend(["--wordlist", os.path.expanduser(wordlist)])
 
     try:
         result = subprocess.run(
@@ -119,7 +142,7 @@ def run_fuzz(target: str, mode: str, wordlist: str = "auto", program: str = None
             "returncode": result.returncode,
             "stdout": result.stdout,
             "stderr": result.stderr,
-            "output_file": output_file,
+            "command": cmd,
         }
     except Exception as e:
         return {
@@ -137,6 +160,10 @@ def hunt(
     model: str = None,
     parallel: bool = False,
     target_base: str = None,
+    core_program: str = None,
+    family: str = DEFAULT_CORE_FAMILY,
+    lane: str = DEFAULT_CORE_LANE,
+    no_core: bool = False,
 ) -> dict:
     """Run an automated hunting workflow.
 
@@ -147,6 +174,10 @@ def hunt(
         model: Model variant (sonnet/opus)
         parallel: If True, run agents in parallel (not yet implemented)
         target_base: Override target base URL (auto-detected from scope if None)
+        core_program: Optional bounty-core program identity. Defaults to target_base hostname inference.
+        family: bounty-core storage family (default: web_bounty)
+        lane: bounty-core storage lane (default: web)
+        no_core: Disable bounty-core ledger/report/index writes when True
 
     Returns:
         dict with keys: agents, findings_saved, errors
@@ -155,10 +186,10 @@ def hunt(
         tasks = ["recon"]
 
     # Load credentials
-    creds, account = load_credentials(program_name)
+    creds, account = load_credentials(program_name, family=family, lane=lane)
 
     # Prepare context
-    context = prep_recon_context(program_name)
+    context = prep_recon_context(program_name, family=family, lane=lane)
 
     # Get scope for target_base
     if target_base is None:
@@ -168,16 +199,27 @@ def hunt(
         if not target_base:
             target_base = f"https://www.{program_name}.com"
 
+    # Compatibility rule: the legacy hunt positional program remains the default
+    # shared identity. A real URL is still used for target_base/context, but it
+    # should not silently turn `hunt acme` into core program `acme-com`.
+    resolved_core_program = infer_core_program(core_program or program_name or target_base)
+
     results = {
         "agents": [],
         "findings_saved": 0,
+        "core_findings_written": 0,
+        "core_findings_new": 0,
+        "core_errors": [],
         "errors": [],
         "program": program_name,
+        "core_program": None if no_core else resolved_core_program,
+        "family": family,
+        "lane": lane,
         "tasks": tasks,
     }
 
     # Get logger
-    logger = get_logger(program_name, "hunt")
+    logger = get_logger(program_name, "hunt", family=family, lane=lane)
     if logger:
         logger.start(target=target_base, tasks=",".join(tasks), runtime=runtime.value)
 
@@ -234,8 +276,21 @@ def hunt(
             # Try to parse findings from agent output
             findings = parse_findings_from_output(result.get("stdout", ""), program_name, task_type)
             for finding in findings:
-                save_finding(finding)
+                save_finding(
+                    finding,
+                    core_program=resolved_core_program,
+                    family=family,
+                    lane=lane,
+                    no_core=no_core,
+                    record_core_result=True,
+                )
                 results["findings_saved"] += 1
+                core_result = finding.get("core_result") or {}
+                if core_result.get("ok"):
+                    results["core_findings_written"] += core_result.get("written", 0)
+                    results["core_findings_new"] += core_result.get("new", 0)
+                elif core_result:
+                    results["core_errors"].append(core_result.get("error") or core_result.get("errors"))
 
             if logger:
                 logger.result(f"Completed {task_type}: {len(findings)} findings", findings_count=len(findings))
@@ -313,14 +368,34 @@ def hunt_cli():
     parser.add_argument("--tasks", default="recon", help="Comma-separated tasks")
     parser.add_argument("--runtime", default="claude", choices=["claude", "codex"])
     parser.add_argument("--model", choices=["sonnet", "opus"])
+    parser.add_argument("--core-program", "--name", dest="core_program", default=None,
+                        help="bounty-core program/target identity/name (default: legacy program argument)")
+    parser.add_argument("--family", default=DEFAULT_CORE_FAMILY,
+                        help=f"bounty-core storage family for ledger writes (default: {DEFAULT_CORE_FAMILY})")
+    parser.add_argument("--lane", default=DEFAULT_CORE_LANE,
+                        help=f"bounty-core storage lane for ledger writes (default: {DEFAULT_CORE_LANE})")
+    parser.add_argument("--no-core", action="store_true",
+                        help="Disable bounty-core ledger/report/index writes")
     args = parser.parse_args()
 
     tasks = args.tasks.split(",")
     runtime = AgentRuntime.CLAUDE if args.runtime == "claude" else AgentRuntime.CODEX
 
-    results = hunt(args.program, tasks, runtime, args.model)
+    results = hunt(
+        args.program,
+        tasks,
+        runtime,
+        args.model,
+        core_program=args.core_program,
+        family=args.family,
+        lane=args.lane,
+        no_core=args.no_core,
+    )
     print(f"Completed {len(results['agents'])} tasks")
     print(f"Findings saved: {results['findings_saved']}")
+    if not args.no_core:
+        print(f"bounty-core identity: program={results.get('core_program')} family={args.family} lane={args.lane}")
+        print(f"bounty-core findings: wrote {results.get('core_findings_written', 0)} ({results.get('core_findings_new', 0)} new)")
     if results["errors"]:
         print(f"Errors: {results['errors']}")
 

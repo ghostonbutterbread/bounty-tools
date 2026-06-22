@@ -2,13 +2,33 @@
 Context Preparation — Prepares reconnaissance context for agents before they are spawned.
 """
 
-import os
 import json
 from datetime import datetime
-from typing import Optional
+from pathlib import Path
+
+try:
+    from recon_storage import DEFAULT_FAMILY, DEFAULT_LANE, resolve_recon_root
+except ImportError:
+    DEFAULT_FAMILY = "web_bounty"
+    DEFAULT_LANE = "web"
+    resolve_recon_root = None
 
 
-def prep_recon_context(program_name: str, vuln_types: list = None, max_endpoints: int = 50) -> dict:
+def _canonical_recon_dir(program_name: str, family: str, lane: str) -> Path:
+    if resolve_recon_root is not None:
+        recon_root, _ = resolve_recon_root(program_name, family=family, lane=lane, create=False)
+        return recon_root
+    return Path.home() / "Shared" / family / program_name / lane / "recon"
+
+
+def prep_recon_context(
+    program_name: str,
+    vuln_types: list = None,
+    max_endpoints: int = 50,
+    *,
+    family: str = DEFAULT_FAMILY,
+    lane: str = DEFAULT_LANE,
+) -> dict:
     """Prepare reconnaissance context for a target.
 
     Args:
@@ -19,10 +39,13 @@ def prep_recon_context(program_name: str, vuln_types: list = None, max_endpoints
     Returns:
         dict with recon data ready for agent context
     """
-    recon_dir = os.path.expanduser(f"~/Shared/bounty_recon/{program_name}/ghost")
+    recon_dir = _canonical_recon_dir(program_name, family, lane)
 
     context = {
         "program": program_name,
+        "family": family,
+        "lane": lane,
+        "recon_root": str(recon_dir),
         "prepared_at": datetime.now().isoformat(),
         "scope": [],
         "endpoints": [],
@@ -34,55 +57,60 @@ def prep_recon_context(program_name: str, vuln_types: list = None, max_endpoints
     }
 
     # Load scope if available
-    scope_file = os.path.join(recon_dir, "scope.json")
-    if os.path.exists(scope_file):
-        with open(scope_file, 'r') as f:
-            context["scope"] = json.load(f)
+    scope_files = []
+    direct_scope = recon_dir / "scope.json"
+    if direct_scope.exists():
+        scope_files.append(direct_scope)
+    scope_dir = recon_dir / "scope"
+    if scope_dir.exists():
+        scope_files.extend(scope_dir.rglob("*.json"))
+    for scope_file in scope_files:
+        try:
+            data = json.loads(scope_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(data, list):
+            context["scope"].extend(data)
+        elif isinstance(data, dict):
+            context["scope"].append(data)
 
     # Load all gathered URLs
-    urls_dir = os.path.join(recon_dir, "urls")
-    if os.path.exists(urls_dir):
-        for filename in os.listdir(urls_dir):
-            if filename.endswith('.txt'):
-                filepath = os.path.join(urls_dir, filename)
-                try:
-                    with open(filepath, 'r') as f:
-                        urls = [u.strip() for u in f.readlines() if u.strip()]
-                        context["endpoints"].extend(urls)
-                except OSError:
-                    pass
+    urls_dir = recon_dir / "urls"
+    if urls_dir.exists():
+        for filepath in urls_dir.rglob("*.txt"):
+            try:
+                urls = [u.strip() for u in filepath.read_text(encoding="utf-8").splitlines() if u.strip()]
+                context["endpoints"].extend(urls)
+            except OSError:
+                pass
 
     # Load JS endpoints
-    js_file = os.path.join(recon_dir, "js_analysis.json")
-    if os.path.exists(js_file):
+    js_file = recon_dir / "js_analysis.json"
+    if js_file.exists():
         try:
-            with open(js_file, 'r') as f:
-                js_data = json.load(f)
-                context["js_endpoints"] = js_data.get("endpoints", [])
-                context["js_secrets"] = js_data.get("secrets", [])
+            js_data = json.loads(js_file.read_text(encoding="utf-8"))
+            context["js_endpoints"] = js_data.get("endpoints", [])
+            context["js_secrets"] = js_data.get("secrets", [])
         except (OSError, json.JSONDecodeError):
             pass
 
     # Load tested endpoints
-    tested_file = os.path.join(recon_dir, "tested.json")
-    if os.path.exists(tested_file):
+    tested_file = recon_dir / "tested.json"
+    if tested_file.exists():
         try:
-            with open(tested_file, 'r') as f:
-                context["tested_endpoints"] = json.load(f)
+            context["tested_endpoints"] = json.loads(tested_file.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             pass
 
-    # Load previous findings
-    findings_dir = os.path.join(recon_dir, "findings")
-    if os.path.exists(findings_dir):
-        for filename in os.listdir(findings_dir):
-            if filename.endswith('.json'):
-                filepath = os.path.join(findings_dir, filename)
-                try:
-                    with open(filepath, 'r') as f:
-                        context["previous_findings"].append(json.load(f))
-                except (OSError, json.JSONDecodeError):
-                    pass
+    # Load previous findings from canonical bounty-core ledgers.
+    try:
+        from orchestrator.findings_store import load_all_findings
+        context["previous_findings"] = [
+            finding for finding in load_all_findings()
+            if finding.get("program") == program_name or finding.get("target") == program_name
+        ]
+    except Exception:
+        pass
 
     # Filter by vuln type if specified
     if vuln_types:

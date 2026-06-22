@@ -54,7 +54,7 @@ Codex Agent ──────────┴──→ Chrome MCP ──→ Chro
 |------|---------|
 | `cli.py` | CLI entry point (`python cli.py`) |
 | `state_manager.py` | Thread-safe state with file locking |
-| `findings_store.py` | Centralized finding storage |
+| `findings_store.py` | Compatibility facade over bounty-core findings |
 | `context_prep.py` | Prepares recon context for agents |
 | `spawn.py` | Unified agent spawner (Claude Code + Codex) |
 | `hunt.py` | High-level `hunt()` interface |
@@ -141,7 +141,7 @@ python3 cli.py report --format markdown
 
 ## State File
 
-`~/Shared/bounty_recon/orchestrator/state.json`
+`~/Shared/web_bounty/orchestrator/web/working/orchestrator/state.json`
 
 ```json
 {
@@ -250,7 +250,7 @@ orchestrator/
 ├── cli.py               # CLI entry point
 ├── config.py            # Configuration constants
 ├── state_manager.py     # Thread-safe state with file locking
-├── findings_store.py    # Finding storage and reporting
+├── findings_store.py    # bounty-core finding compatibility facade
 ├── context_prep.py      # Recon context preparation
 ├── spawn.py             # Unified agent spawner
 ├── hunt.py              # High-level hunt workflow
