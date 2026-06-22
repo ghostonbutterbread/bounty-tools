@@ -2,8 +2,9 @@
 
 This is the canonical bounty-tools copy of the Caido-first prototype for Ryushe's "browse normally, replay with disposable auth, alert on useful error bugs" idea.
 
-It has two pieces:
+It has three pieces:
 
+- `caido-passive-replay.workflow.json` - JSON workflow definition with the passive node graph and safe default `extra` values.
 - `caido-passive-replay.js` - paste into a Caido Passive Workflow JavaScript node.
 - `replay_worker.py` - local helper for testing the same safety/error logic from a saved request JSON.
 
@@ -17,7 +18,7 @@ On Intercept Request -> In Scope -> Javascript
 
 Paste `caido-passive-replay.js` into the JavaScript node.
 
-Configure these JavaScript node `extra` values:
+Use `caido-passive-replay.workflow.json` as the JSON source of truth for the node graph and default configuration. Configure these JavaScript node `extra` values:
 
 ```json
 {

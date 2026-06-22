@@ -1,0 +1,81 @@
+{
+  "schema": "ghost.bounty-tools.caido-workflow.v1",
+  "name": "Disposable Auth Error Replay",
+  "description": "Passive Caido workflow definition for replaying scoped requests with disposable auth and alerting on high-signal parser/error deltas.",
+  "type": "passive",
+  "version": "0.1.0",
+  "safety": {
+    "defaultMode": "safe",
+    "noRealSecrets": true,
+    "dangerousRoutesBlockedByDefault": true,
+    "stateChangingMethodsRequireOwnedResourceMode": true
+  },
+  "nodes": [
+    {
+      "id": "on_intercept_request",
+      "type": "On Intercept Request",
+      "label": "On Intercept Request"
+    },
+    {
+      "id": "in_scope",
+      "type": "In Scope",
+      "label": "In Scope"
+    },
+    {
+      "id": "disposable_auth_error_replay_js",
+      "type": "Javascript",
+      "label": "Disposable Auth Error Replay",
+      "sourceFile": "caido-passive-replay.js",
+      "entrypoint": "run",
+      "extra": {
+        "mode": "safe",
+        "disposableAuthorization": "",
+        "disposableCookie": "",
+        "ownedPathMarkers": [
+          "/drafts/",
+          "/projects/disposable-"
+        ],
+        "maxProbes": 8,
+        "probeValues": [
+          "'",
+          "\"",
+          "%27",
+          "%22",
+          "--",
+          ")",
+          "{",
+          "bad_enum__"
+        ]
+      }
+    },
+    {
+      "id": "passive_end",
+      "type": "Passive End",
+      "label": "Passive End"
+    }
+  ],
+  "edges": [
+    {
+      "from": "on_intercept_request",
+      "to": "in_scope"
+    },
+    {
+      "from": "in_scope",
+      "to": "disposable_auth_error_replay_js",
+      "condition": "true"
+    },
+    {
+      "from": "disposable_auth_error_replay_js",
+      "to": "passive_end"
+    }
+  ],
+  "installation": {
+    "caidoWorkflowShape": "On Intercept Request -> In Scope -> Javascript -> Passive End",
+    "javascriptNodeSource": "caido-passive-replay.js",
+    "notes": [
+      "Paste the JavaScript source into the Caido Javascript node.",
+      "Copy the extra object from this JSON into the Javascript node extra values.",
+      "Set disposableAuthorization or disposableCookie only inside Caido; do not commit real tokens or cookies."
+    ]
+  }
+}
